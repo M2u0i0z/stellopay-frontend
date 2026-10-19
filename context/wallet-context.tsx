@@ -13,7 +13,9 @@ import React, {
   useCallback,
   useContext,
   useEffect,
+  useId,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import type {
@@ -26,14 +28,12 @@ import type {
   WalletProviderProps,
 } from "@/types/wallet";
 import { isWalletAddress, isWalletConnectionResult } from "@/types/wallet";
+import { createAccountScope, realtimeRegistry } from "@/lib/realtime-registry";
 
-// Networks exposed to the UI. Stellar is the only network the product is
-// actually built on, so it is the sole supported entry. The placeholder EVM
-// chains (ETH, Polygon, BSC, Arbitrum) were removed because they had no real
-// adapters behind them — they will be added back here once genuine multichain
-// support lands.
 export const SUPPORTED_NETWORKS: Network[] = [
   { id: "stellar", name: "Stellar" },
+  { id: "testnet", name: "Testnet" },
+  { id: "futurenet", name: "Futurenet" },
 ];
 
 export const DEFAULT_NETWORK: Network = SUPPORTED_NETWORKS[0];
@@ -49,6 +49,19 @@ const DEFAULT_CAPABILITIES: WalletCapabilities = {
   canSignMessage: false,
   canSwitchNetwork: false,
 };
+
+type DirtySource = () => boolean;
+
+interface DirtyGuardContextValue {
+  isDirty: () => boolean;
+  registerDirtySource: (sourceId: string, isDirty: DirtySource) => () => void;
+  confirmDiscard: () => boolean;
+}
+
+const DirtyGuardContext = createContext<DirtyGuardContextValue | undefined>(undefined);
+
+const DISCARD_WARNING =
+  "You have unsaved changes. Discard them and continue?";
 
 const WalletContext = createContext<WalletContextValue | undefined>(undefined);
 
@@ -99,6 +112,27 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
     initialNetwork ?? DEFAULT_NETWORK,
   );
   const [isUnsupportedNetwork, setIsUnsupportedNetwork] = useState(false);
+
+  const dirtySourcesRef = useRef(new Map<string, () => boolean>());
+
+  // Account scope of the currently active wallet context. All realtime
+  // subscriptions opened by views are owned by this scope, so the provider
+  // can tear them down when the account (or network) is replaced.
+  const scope = createAccountScope(network.id, address);
+
+  // Tear down realtime channels owned by the *previous* account scope before
+  // the new account context takes over. React runs this cleanup (which closes
+  // over the old scope) whenever the scope changes — account switch, logout,
+  // network switch — and on provider unmount. Combined with the registry's
+  // ownership guard, this guarantees no previous-account event can ever reach
+  // a listener opened for the current account (issue #1179).
+  useEffect(() => {
+    return () => {
+      if (scope) {
+        realtimeRegistry.unsubscribeScope(scope);
+      }
+    };
+  }, [scope]);
 
   const capabilities = useMemo<WalletCapabilities>(() => {
     const base = {
@@ -181,6 +215,85 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
     [address, capabilities, isUnsupportedNetwork],
   );
 
+  const isDirty = useCallback(() => {
+    for (const source of dirtySourcesRef.current.values()) {
+      if (source()) return true;
+    }
+    return false;
+  }, []);
+
+  const registerDirtySource = useCallback(
+    (sourceId: string, isDirtySource: DirtySource) => {
+      dirtySourcesRef.current.set(sourceId, isDirtySource);
+      return () => {
+        dirtySourcesRef.current.delete(sourceId);
+      };
+    },
+    [],
+  );
+
+  const confirmDiscard = useCallback(() => {
+    if (!isDirty()) return true;
+    if (typeof window === "undefined") return true;
+    return window.confirm(DISCARD_WARNING);
+  }, [isDirty]);
+
+  const dirtyGuardValue = useMemo<DirtyGuardContextValue>(
+    () => ({
+      isDirty,
+      registerDirtySource,
+      confirmDiscard,
+    }),
+    [isDirty, registerDirtySource, confirmDiscard],
+  );
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (!isDirty()) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, [isDirty]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleClick = (event: MouseEvent) => {
+      if (
+        event.button !== 0 ||
+        event.metaKey ||
+        event.ctrlKey ||
+        event.shiftKey ||
+        event.altKey
+      ) {
+        return;
+      }
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const anchor = target.closest("a[href]");
+      if (!anchor) return;
+      if (anchor.target === "_blank" || anchor.hasAttribute("download")) return;
+      const href = anchor.getAttribute("href");
+      if (
+        !href ||
+        href.startsWith("#") ||
+        href.startsWith("javascript:") ||
+        href.startsWith("mailto:") ||
+        href.startsWith("tel:")
+      ) {
+        return;
+      }
+      if (!confirmDiscard()) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    };
+    document.addEventListener("click", handleClick, true);
+    return () => document.removeEventListener("click", handleClick, true);
+  }, [confirmDiscard]);
+
   // Hydrate the network on the client. Running this in an effect (rather than
   // in useState's initializer) keeps server and first client render in sync,
   // avoiding the React hydration mismatch warning.
@@ -206,6 +319,7 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
     if (!subscribeToNetworkChanges) return;
 
     const cleanup = subscribeToNetworkChanges((networkId: string) => {
+      if (!confirmDiscard()) return;
       const matched = SUPPORTED_NETWORKS.find((n) => n.id === networkId);
       if (matched) {
         setNetworkState(matched);
@@ -222,21 +336,22 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
     return () => {
       cleanup?.();
     };
-  }, [subscribeToNetworkChanges]);
+  }, [subscribeToNetworkChanges, confirmDiscard]);
 
   useEffect(() => {
     if (!subscribeToAccountChanges) return;
 
     const cleanup = subscribeToAccountChanges((nextAddress: string | null) => {
+      if (!confirmDiscard()) return;
       setAddress(nextAddress);
     });
 
     return () => {
       cleanup?.();
     };
-  }, [subscribeToAccountChanges]);
+  }, [subscribeToAccountChanges, confirmDiscard]);
 
-  const setNetwork = useCallback((next: Network) => {
+  const applyNetwork = useCallback((next: Network) => {
     const supported = SUPPORTED_NETWORKS.some((n) => n.id === next.id);
     setNetworkState(next);
     setIsUnsupportedNetwork(!supported);
@@ -245,8 +360,17 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
     }
   }, []);
 
+  const setNetwork = useCallback(
+    (next: Network) => {
+      if (!confirmDiscard()) return;
+      applyNetwork(next);
+    },
+    [applyNetwork, confirmDiscard],
+  );
+
   const connect = useCallback((next?: string | WalletConnectionResult) => {
     if (next === undefined) {
+      if (!confirmDiscard()) return;
       setAddress(SYNTHETIC_ADDRESS);
       return;
     }
@@ -266,6 +390,7 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
           "WalletProvider.connect rejected an invalid Stellar public address.",
         );
       }
+      if (!confirmDiscard()) return;
       setAddress(next.trim());
       return;
     }
@@ -276,15 +401,17 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
       );
     }
 
+    if (!confirmDiscard()) return;
     setAddress(next.address.trim());
     if (next.network) {
-      setNetwork(next.network);
+      applyNetwork(next.network);
     }
-  }, [setNetwork]);
+  }, [applyNetwork, confirmDiscard]);
 
   const disconnect = useCallback(() => {
+    if (!confirmDiscard()) return;
     setAddress(null);
-  }, []);
+  }, [confirmDiscard]);
 
   const value = useMemo<WalletContextValue>(
     () => ({
@@ -303,7 +430,9 @@ export const WalletProvider: React.FC<WalletProviderProps> = ({
   );
 
   return (
-    <WalletContext.Provider value={value}>{children}</WalletContext.Provider>
+    <DirtyGuardContext.Provider value={dirtyGuardValue}>
+      <WalletContext.Provider value={value}>{children}</WalletContext.Provider>
+    </DirtyGuardContext.Provider>
   );
 };
 
@@ -317,6 +446,35 @@ export function useWallet(): WalletContextValue {
     );
   }
   return ctx;
+}
+
+// Read the shared dirty-state guard. Throws when used outside of the
+// WalletProvider, same contract as useWallet.
+export function useDirtyGuard(): DirtyGuardContextValue {
+  const ctx = useContext(DirtyGuardContext);
+  if (!ctx) {
+    throw new Error(
+      "useDirtyGuard must be used within a WalletProvider. Wrap the tree in <WalletProvider>.",
+    );
+  }
+  return ctx;
+}
+
+// Register a form's dirty state with the shared guard. While `isDirty` is
+// true, wallet changes, route navigations, and browser unloads will warn.
+// Set `isDirty` to false on successful submit to clear the guard.
+export function useDirtyForm(isDirty: boolean): void {
+  const { registerDirtySource } = useDirtyGuard();
+  const id = useId();
+  const isDirtyRef = useRef(isDirty);
+
+  useEffect(() => {
+    isDirtyRef.current = isDirty;
+  }, [isDirty]);
+
+  useEffect(() => {
+    return registerDirtySource(id, () => isDirtyRef.current);
+  }, [registerDirtySource, id]);
 }
 
 // Truncate a Stellar address for display: GABC...F123. Kept here so every

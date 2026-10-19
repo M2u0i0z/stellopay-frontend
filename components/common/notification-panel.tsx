@@ -12,6 +12,173 @@ import {
   formatRelativeTime,
   toIsoDateTime,
 } from "@/utils/date-utils";
+import { ApiResponseValidationError, parseNotifications } from "@/lib/api";
+
+/** Fetchers return unknown because network JSON is untrusted until validated. */
+export type NotificationFetcher = (signal: AbortSignal) => Promise<unknown>;
+
+interface NotificationRequestEntry {
+  fetcher: NotificationFetcher;
+  promise: Promise<NotificationItem[]>;
+  controller: AbortController;
+  refCount: number;
+}
+
+const notificationRequests = new Map<string, NotificationRequestEntry>();
+const notificationDataCache = new Map<string, NotificationItem[]>();
+const notificationInvalidationListeners = new Set<(cacheKey?: string) => void>();
+
+function subscribeToNotificationInvalidation(listener: (cacheKey?: string) => void) {
+  notificationInvalidationListeners.add(listener);
+  return () => {
+    notificationInvalidationListeners.delete(listener);
+  };
+}
+
+function getSharedNotificationRequest(
+  cacheKey: string,
+  fetcher: NotificationFetcher,
+) {
+  let request = notificationRequests.get(cacheKey);
+
+  if (!request) {
+    const controller = new AbortController();
+    const promise = fetcher(controller.signal)
+      .then((data) => {
+        const notifications = parseNotifications(data);
+        if (notificationRequests.get(cacheKey)?.promise === promise) {
+          notificationDataCache.set(cacheKey, notifications);
+        }
+        return notifications;
+      })
+      .finally(() => {
+        if (notificationRequests.get(cacheKey)?.promise === promise) {
+          notificationRequests.delete(cacheKey);
+        }
+      });
+
+    request = { fetcher, promise, controller, refCount: 0 };
+    notificationRequests.set(cacheKey, request);
+  }
+
+  request.refCount += 1;
+
+  let released = false;
+  return {
+    promise: request.promise,
+    release: () => {
+      if (released) return;
+      released = true;
+      request.refCount -= 1;
+      if (
+        request.refCount <= 0 &&
+        notificationRequests.get(cacheKey) === request
+      ) {
+        request.controller.abort();
+        notificationRequests.delete(cacheKey);
+      }
+    },
+  };
+}
+
+export function invalidateNotifications(cacheKey?: string) {
+  if (cacheKey !== undefined) {
+    notificationDataCache.delete(cacheKey);
+    const request = notificationRequests.get(cacheKey);
+    if (request) {
+      request.controller.abort();
+      notificationRequests.delete(cacheKey);
+    }
+  } else {
+    notificationDataCache.clear();
+    notificationRequests.forEach((request) => {
+      request.controller.abort();
+    });
+    notificationRequests.clear();
+  }
+  notificationInvalidationListeners.forEach((listener) => listener(cacheKey));
+}
+
+export function useSharedNotifications(
+  cacheKey: string,
+  fetcher: NotificationFetcher,
+) {
+  const [data, setData] = useState<NotificationItem[] | null>(() =>
+    notificationDataCache.get(cacheKey) ?? null,
+  );
+  const [isLoading, setIsLoading] = useState(
+    () => !notificationDataCache.has(cacheKey),
+  );
+  const [error, setError] = useState<ApiResponseValidationError | null>(null);
+
+  const fetcherRef = useRef(fetcher);
+
+  useEffect(() => {
+    fetcherRef.current = fetcher;
+  }, [fetcher]);
+
+  useEffect(() => {
+    let active = true;
+    let release: (() => void) | null = null;
+    let currentPromise: Promise<NotificationItem[]> | null = null;
+
+    const load = () => {
+      if (notificationDataCache.has(cacheKey)) {
+        currentPromise = null;
+        setData(notificationDataCache.get(cacheKey) ?? []);
+        setIsLoading(false);
+        setError(null);
+        return;
+      }
+
+      setIsLoading(true);
+      setError(null);
+      const request = getSharedNotificationRequest(cacheKey, fetcherRef.current);
+      release = request.release;
+      currentPromise = request.promise;
+      request.promise
+        .then((items) => {
+          if (!active || currentPromise !== request.promise) return;
+          setData(items);
+          setIsLoading(false);
+        })
+        .catch((reason: unknown) => {
+          if (active && currentPromise === request.promise) {
+            setError(reason instanceof ApiResponseValidationError ? reason : null);
+            setIsLoading(false);
+          }
+        });
+    };
+
+    load();
+
+    const unsubscribe = subscribeToNotificationInvalidation((invalidatedKey) => {
+      if (!active) return;
+      if (invalidatedKey !== undefined && invalidatedKey !== cacheKey) return;
+      if (release) {
+        release();
+        release = null;
+      }
+      setData(null);
+      setIsLoading(true);
+      load();
+    });
+
+    return () => {
+      active = false;
+      unsubscribe();
+      if (release) release();
+    };
+  }, [cacheKey]);
+
+  const refetch = useCallback(() => {
+    invalidateNotifications(cacheKey);
+  }, [cacheKey]);
+
+  return { data, isLoading, error, refetch };
+}
+
+export const useNotifications = useSharedNotifications;
 
 export const CATEGORY_STORAGE_KEY = "notification-panel-category-filter";
 
@@ -249,6 +416,7 @@ const NotificationPanel = ({
       prev.map((n) => (n.read ? n : { ...n, read: true, readAt })),
     );
     onMarkAllAsRead?.();
+    invalidateNotifications();
   }, [onMarkAllAsRead]);
 
   const handleClearAll = useCallback(() => {
